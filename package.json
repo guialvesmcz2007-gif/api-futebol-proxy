@@ -1,0 +1,168 @@
+PROXY PARA O CONECTOR DO SITE — API DE FUTEBOL
+
+O que faz:
+- Cria um endpoint /api/matches no formato { "matches": [...] }.
+- Consulta jogos e odds da API-Football.
+- Ativa CORS para o site conseguir consultar pelo navegador.
+- Mantém a chave da API no servidor, não no campo público do site.
+
+IMPORTANTE:
+Você precisa de uma chave válida da API-Football e precisa publicar este projeto em um serviço de hospedagem. Este ZIP NÃO é, por si só, um endereço HTTPS público.
+
+COMO PUBLICAR NO RENDER:
+1. Descompacte este ZIP e envie os arquivos para um repositório GitHub.
+2. No Render, crie um Web Service conectado a esse repositório.
+3. Build Command: npm install
+4. Start Command: npm start
+5. Em Environment Variables, adicione:
+   API_FOOTBALL_KEY = sua chave da API-Football
+6. Depois de publicar, copie a URL HTTPS criada pelo Render e acrescente:
+   /api/matches
+7. Cole esse endereço completo no campo Endpoint JSON do seu site.
+
+Exemplo de formato final (a URL real será a que o Render fornecer):
+https://SEU-SERVICO.onrender.com/api/matches
+
+Para testar uma data específica:
+https://SEU-SERVICO.onrender.com/api/matches?date=2026-10-22
+
+A disponibilidade de odds depende da sua assinatura/cobertura da API-Football. O conector pode mostrar jogos sem mercados se a API não devolver odds para eles. O endpoint transforma as odds 1X2 e algumas linhas de gols quando disponíveis; não garante mercados de escanteios/cartões se o provedor não os retornar neste endpoint.
+
+services:
+  - type: web
+    name: api-futebol-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: API_FOOTBALL_KEY
+        sync: false
+
+import express from "express";
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_FOOTBALL_KEY;
+
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.get("/", (_req, res) => {
+  res.json({
+    status: "ok",
+    endpoint: "/api/matches",
+    message: "Configure API_FOOTBALL_KEY nas variáveis de ambiente do servidor."
+  });
+});
+
+app.get("/api/matches", async (req, res) => {
+  if (!API_KEY) {
+    return res.status(500).json({ error: "Falta configurar API_FOOTBALL_KEY no servidor." });
+  }
+
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(req.query.date || "")
+    ? req.query.date
+    : new Date().toISOString().slice(0, 10);
+
+  try {
+    const base = "https://apiv3.apifootball.com/";
+    const eventsUrl = new URL(base);
+    eventsUrl.searchParams.set("action", "get_events");
+    eventsUrl.searchParams.set("from", date);
+    eventsUrl.searchParams.set("to", date);
+    eventsUrl.searchParams.set("APIkey", API_KEY);
+
+    const oddsUrl = new URL(base);
+    oddsUrl.searchParams.set("action", "get_odds");
+    oddsUrl.searchParams.set("from", date);
+    oddsUrl.searchParams.set("to", date);
+    oddsUrl.searchParams.set("APIkey", API_KEY);
+
+    const [eventsResponse, oddsResponse] = await Promise.all([
+      fetch(eventsUrl),
+      fetch(oddsUrl)
+    ]);
+
+    if (!eventsResponse.ok || !oddsResponse.ok) {
+      return res.status(502).json({ error: "A API de futebol não respondeu corretamente." });
+    }
+
+    const [eventsData, oddsData] = await Promise.all([
+      eventsResponse.json(),
+      oddsResponse.json()
+    ]);
+
+    const events = Array.isArray(eventsData) ? eventsData : [];
+    const oddsRows = Array.isArray(oddsData) ? oddsData : [];
+
+    const matches = events.map((event) => {
+      const rows = oddsRows.filter((odd) => String(odd.match_id) === String(event.match_id));
+      const first = rows[0] || {};
+      const outcomes = [];
+      const add = (label, value) => {
+        const n = Number(value);
+        if (value !== undefined && value !== null && value !== "" && Number.isFinite(n) && n > 1) {
+          outcomes.push({ label, odds: n });
+        }
+      };
+
+      // Odds principais 1X2
+      add(event.match_hometeam_name || "Casa", first.odd_1);
+      add("Empate", first.odd_x);
+      add(event.match_awayteam_name || "Fora", first.odd_2);
+
+      const markets = [];
+      if (outcomes.length) {
+        markets.push({ name: "Resultado da partida", outcomes });
+      }
+
+      // Alguns planos retornam linhas de gols. Inclui as que estiverem disponíveis.
+      const goalOutcomes = [];
+      for (const odd of rows) {
+        for (const [key, value] of Object.entries(odd)) {
+          const match = key.match(/^odd_(over|under)_(\d+(?:\.\d+)?)$/i);
+          if (match) addGoal(goalOutcomes, `${match[1].toLowerCase() === "over" ? "Mais de" : "Menos de"} ${match[2]}`, value);
+        }
+      }
+      function unused() {}
+      if (goalOutcomes.length) markets.push({ name: "Gols", outcomes: goalOutcomes });
+
+      return {
+        league: event.league_name || event.country_name || "Futebol",
+        home: event.match_hometeam_name || "Time da casa",
+        away: event.match_awayteam_name || "Time visitante",
+        time: [event.match_date, event.match_time].filter(Boolean).join(" "),
+        markets
+      };
+    }).filter(m => m.home && m.away);
+
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ matches });
+  } catch (err) {
+    return res.status(502).json({ error: "Falha ao consultar a API de futebol.", detail: String(err) });
+  }
+});
+
+function addGoal(list, label, value) {
+  const n = Number(value);
+  if (value !== undefined && value !== null && value !== "" && Number.isFinite(n) && n > 1) {
+    list.push({ label, odds: n });
+  }
+}
+
+app.listen(PORT, () => console.log(`API proxy listening on ${PORT}`));
+
+{
+  "name": "api-futebol-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.21.2" }
+}
